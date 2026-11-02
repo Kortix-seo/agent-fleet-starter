@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=https://kortix.com/schema/kortix.v3.schema.json
+#
+# agent-fleet-starter: a fleet you can read.
+#
+# Three agents, one registry of who owns what, one policy set of connector
+# rules, and a run record committed for every job. Every file here is text a
+# person can open in an editor, and every change lands through a change request.
+#
+# Reference: https://kortix.com/docs/developers#kortixyaml-reference
+
+default_agent: foreman
+
+project:
+  name: agent-fleet-starter
+  description: A minimal agent fleet on Kortix — one registry, one policy set, one run record per job, all as files in a repository the company owns.
+
+skills:
+  fleet-registry: skills/fleet-registry
+  fleet-policy: skills/fleet-policy
+  fleet-audit: skills/fleet-audit
+
+# One connector stands in for the systems your agents touch. Point base_url at
+# your own service; the credential lives in Kortix, never in this file.
+connectors:
+  - slug: warehouse
+    name: Warehouse API
+    provider: http
+    base_url: https://api.example.com/v1
+    auth:
+      type: bearer
+    sensitive: true
+    policy_sets:
+      read-only:
+        description: Reads the warehouse. Never writes to it.
+        policies:
+          - match: "get_*"
+            action: always_run
+          - match: "*"
+            action: block
+
+# A call that no rule matches: a read runs, a write or a delete waits for a person.
+policy:
+  default_mode: risk
+
+# Project-wide rules. These run before any policy set, so no agent can loosen them.
+policies:
+  - match: "warehouse.*delete*"
+    action: block
+  - match: "warehouse.update_stock"
+    action: require_approval
+
+# How long a held call waits for a decision before it expires.
+approvals:
+  ttl: 4h
+
+agents:
+  foreman:
+    description: Takes a job, splits it, hands each part to the worker, and lands the result as a change request. Looks after the fleet registry.
+    mode: primary
+    prompt_file: agents/foreman.md
+    permission:
+      bash:
+        "*": allow
+        "git push *": ask
+        "rm -rf *": deny
+      webfetch: ask
+    tools: all
+    skills: [fleet-registry, fleet-policy]
+    subagents: [worker, auditor]
+    connectors: [warehouse]
+    kortix_permissions: [project.session.read, project.gitops.push]
+    workspace: { project_repository: true }
+
+  worker:
+    description: Does one job end to end, reports what it touched, and writes a run record. Reads the warehouse; never changes it.
+    mode: subagent
+    prompt_file: agents/worker.md
+    permission:
+      bash:
+        "*": allow
+        "rm -rf *": deny
+        "curl *": ask
+    tools: all
+    skills: [fleet-policy, fleet-audit]
+    connectors: [warehouse]
+    policy_sets:
+      warehouse: read-only
+    workspace: { project_repository: true }
+
+  auditor:
+    description: Reads the week's run records and the audit picture, then writes one report — what ran, what it cost, what needed a person.
+    mode: subagent
+    prompt_file: agents/auditor.md
+    permission:
+      edit:
+        "*": allow
+        "memory/fleet/registry.md": deny
+    tools: all
+    skills: [fleet-audit]
+    kortix_permissions: [project.session.read]
+    workspace: { project_repository: true }
+
+# The only scheduled thing in the repository: the auditor's weekly report.
+triggers:
+  - slug: weekly-fleet-audit
+    name: Weekly fleet audit
+    on:
+      cron: "0 7 * * 1"
+      timezone: UTC
+    run:
+      agent: auditor
+      prompt: Write this week's fleet audit from runs/ and memory/fleet/, put it in runs/audit-<yyyy-mm-dd>.md, and open a change request.
